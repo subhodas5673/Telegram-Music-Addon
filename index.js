@@ -461,6 +461,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
   let sampleRate = undefined;
   let bitDepth = undefined;
   let isrc = undefined;
+  let bitrate = undefined;
 
   const isMp4Container = ext === 'm4a' || ext === 'mp4';
   const shouldSniffTags = (isMp4Container || !audioAttr || !audioAttr.title || !audioAttr.performer || !isrc) && sizeBytes > 0;
@@ -525,6 +526,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
           if (parsed.format.sampleRate) sampleRate = parsed.format.sampleRate;
           if (parsed.format.bitsPerSample) bitDepth = parsed.format.bitsPerSample;
           if (!duration && parsed.format.duration) duration = Math.round(parsed.format.duration);
+          if (parsed.format.bitrate) bitrate = Math.round(parsed.format.bitrate / 1000);
         }
       }
     } catch (_) {}
@@ -563,7 +565,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
     formatName = 'eac3-joc';
     if (!sampleRate) sampleRate = 48000;
     if (!bitDepth) bitDepth = 16;
-  } else if (formatName === 'm4a' && (hasAlacAtom || parsedCodec === 'ALAC' || rawKbps > 500)) {
+  } else if (formatName === 'm4a' && (hasAlacAtom || parsedCodec === 'ALAC' || rawKbps > 500 || bitDepth === 16 || bitDepth === 24)) {
     formatName = 'alac';
     if (!bitDepth) bitDepth = rawKbps > 2000 ? 24 : 16;
     if (!sampleRate) sampleRate = 48000;
@@ -591,6 +593,7 @@ async function parseTrackMessage(msg, cacheMedia = true) {
     format: formatName,
     sampleRate,
     bitDepth,
+    bitrate,
     quality: qualityText,
     isrc,
     hasArtwork,
@@ -616,8 +619,13 @@ function getQualityScore(track) {
   }
 
   let rawKbps = 320;
-  if (track.sizeBytes && track.duration) {
+  if (track.bitrate) {
+    rawKbps = track.bitrate;
+  } else if (track.sizeBytes && track.duration) {
     rawKbps = Math.round((track.sizeBytes * 8) / (track.duration * 1000));
+    // Hard cap fallback calculation to prevent massive artwork from inflating lossy scores
+    if (fmt === 'mp3' && rawKbps > 320) rawKbps = 320;
+    if ((fmt === 'aac' || fmt === 'm4a' || fmt === 'opus') && rawKbps > 500) rawKbps = 500;
   }
 
   let multiplier = 1.0;
@@ -1174,7 +1182,15 @@ async function processTrackUpload(newTrack) {
 async function deduplicateEntireLibrary() {
   console.log('Scanning library for duplicates...');
   const removed = [];
-  const sorted = [...trackIndex].sort((a, b) => getQualityScore(b) - getQualityScore(a));
+  const sorted = [...trackIndex].sort((a, b) => {
+    const scoreDiff = getQualityScore(b) - getQualityScore(a);
+    if (scoreDiff !== 0) return scoreDiff;
+    // Tie-breaker: keep the one with slightly larger file size (often means better metadata/art)
+    const sizeDiff = (b.sizeBytes || 0) - (a.sizeBytes || 0);
+    if (sizeDiff !== 0) return sizeDiff;
+    // Final tie-breaker: keep the oldest track
+    return parseInt(a.id, 10) - parseInt(b.id, 10);
+  });
   const kept = [];
 
   for (const track of sorted) {
